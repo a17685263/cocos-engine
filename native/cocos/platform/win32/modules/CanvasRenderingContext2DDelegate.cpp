@@ -24,6 +24,10 @@
 
 #include "platform/win32/modules/CanvasRenderingContext2DDelegate.h"
 #include "base/memory/Memory.h"
+#include "platform/win32/modules/DirectWriteTextRasterizer.h"
+
+#include <algorithm>
+#include <cmath>
 
 namespace {
 void fillRectWithColor(uint8_t *buf, uint32_t totalWidth, uint32_t totalHeight, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
@@ -43,16 +47,76 @@ void fillRectWithColor(uint8_t *buf, uint32_t totalWidth, uint32_t totalHeight, 
         }
     }
 }
+
+void blendStraightAlpha(uint8_t *destination, uint8_t red, uint8_t green, uint8_t blue, uint8_t alpha) {
+    if (alpha == 0U) {
+        return;
+    }
+
+    const float sourceAlpha = static_cast<float>(alpha) / 255.0F;
+    const float destinationAlpha = static_cast<float>(destination[3]) / 255.0F;
+    const float outputAlpha = sourceAlpha + destinationAlpha * (1.0F - sourceAlpha);
+    if (outputAlpha <= 0.0F) {
+        return;
+    }
+
+    const float destinationFactor = destinationAlpha * (1.0F - sourceAlpha);
+    destination[0] = static_cast<uint8_t>(std::round((static_cast<float>(red) * sourceAlpha + static_cast<float>(destination[0]) * destinationFactor) / outputAlpha));
+    destination[1] = static_cast<uint8_t>(std::round((static_cast<float>(green) * sourceAlpha + static_cast<float>(destination[1]) * destinationFactor) / outputAlpha));
+    destination[2] = static_cast<uint8_t>(std::round((static_cast<float>(blue) * sourceAlpha + static_cast<float>(destination[2]) * destinationFactor) / outputAlpha));
+    destination[3] = static_cast<uint8_t>(std::round(outputAlpha * 255.0F));
+}
+
+std::vector<uint8_t> dilateCoverage(const std::vector<uint8_t> &source, int width, int height, uint32_t radius) {
+    if (radius == 0U || source.empty()) {
+        return source;
+    }
+
+    std::vector<uint8_t> result(source.size(), 0U);
+    const int signedRadius = static_cast<int>(radius);
+    const int radiusSquared = signedRadius * signedRadius;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            uint8_t maximumCoverage = 0U;
+            const int minimumY = std::max(0, y - signedRadius);
+            const int maximumY = std::min(height - 1, y + signedRadius);
+            const int minimumX = std::max(0, x - signedRadius);
+            const int maximumX = std::min(width - 1, x + signedRadius);
+            for (int sampleY = minimumY; sampleY <= maximumY && maximumCoverage < 255U; ++sampleY) {
+                const int deltaY = sampleY - y;
+                for (int sampleX = minimumX; sampleX <= maximumX; ++sampleX) {
+                    const int deltaX = sampleX - x;
+                    if (deltaX * deltaX + deltaY * deltaY > radiusSquared) {
+                        continue;
+                    }
+                    const size_t sampleIndex = static_cast<size_t>(sampleY) * static_cast<size_t>(width) + static_cast<size_t>(sampleX);
+                    maximumCoverage = std::max(maximumCoverage, source[sampleIndex]);
+                }
+            }
+            result[static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)] = maximumCoverage;
+        }
+    }
+    return result;
+}
 } // namespace
 
 namespace cc {
-CanvasRenderingContext2DDelegate::CanvasRenderingContext2DDelegate() {
+CanvasRenderingContext2DDelegate::CanvasRenderingContext2DDelegate()
+: _directWriteRasterizer(std::make_unique<DirectWriteTextRasterizer>()) {
     HDC hdc = GetDC(_wnd);
     _DC = CreateCompatibleDC(hdc);
     ReleaseDC(_wnd, hdc);
 }
 
 CanvasRenderingContext2DDelegate::~CanvasRenderingContext2DDelegate() {
+    if (_previousPen) {
+        SelectObject(_DC, _previousPen);
+        _previousPen = nullptr;
+    }
+    if (_hpen) {
+        DeleteObject(_hpen);
+        _hpen = nullptr;
+    }
     deleteBitmap();
     removeCustomFont();
     if (_DC)
@@ -77,12 +141,16 @@ void CanvasRenderingContext2DDelegate::recreateBuffer(float w, float h) {
 
 void CanvasRenderingContext2DDelegate::beginPath() {
     // called: set_lineWidth() -> beginPath() -> moveTo() -> lineTo() -> stroke(), when draw line
+    if (_previousPen) {
+        SelectObject(_DC, _previousPen);
+        _previousPen = nullptr;
+    }
+    if (_hpen) {
+        DeleteObject(_hpen);
+        _hpen = nullptr;
+    }
     _hpen = CreatePen(PS_SOLID, static_cast<int>(_lineWidth), RGB(255, 255, 255));
-    // the return value of SelectObject is a handle to the object being replaced, so we should delete them to avoid memory leak
-    HGDIOBJ hOldPen = SelectObject(_DC, _hpen);
-    HGDIOBJ hOldBmp = SelectObject(_DC, _bmp);
-    DeleteObject(hOldPen);
-    DeleteObject(hOldBmp);
+    _previousPen = SelectObject(_DC, _hpen);
 
     SetBkMode(_DC, TRANSPARENT);
 }
@@ -99,12 +167,19 @@ void CanvasRenderingContext2DDelegate::lineTo(float x, float y) {
 }
 
 void CanvasRenderingContext2DDelegate::stroke() {
-    DeleteObject(_hpen);
+    if (_previousPen) {
+        SelectObject(_DC, _previousPen);
+        _previousPen = nullptr;
+    }
+    if (_hpen) {
+        DeleteObject(_hpen);
+        _hpen = nullptr;
+    }
     if (_bufferWidth < 1.0F || _bufferHeight < 1.0F) {
         return;
     }
 
-    fillTextureData();
+    fillTextureData(_strokeStyle);
 }
 
 void CanvasRenderingContext2DDelegate::saveContext() {
@@ -135,7 +210,7 @@ void CanvasRenderingContext2DDelegate::fillRect(float x, float y, float w, float
         return;
     }
 
-    //not filled all Bits in buffer? the buffer length is _bufferWidth * _bufferHeight * 4, but it filled _bufferWidth * _bufferHeight * 3?
+    // not filled all Bits in buffer? the buffer length is _bufferWidth * _bufferHeight * 4, but it filled _bufferWidth * _bufferHeight * 3?
     uint8_t *buffer = _imageData.getBytes();
     if (buffer) {
         uint8_t r = static_cast<uint8_t>(_fillStyle[0] * 255.0f);
@@ -157,16 +232,14 @@ void CanvasRenderingContext2DDelegate::fillText(const ccstd::string &text, float
         return;
     }
 
-    SIZE textSize = {0, 0};
     Point offsetPoint = convertDrawPoint(Point{x, y}, text);
 
-    drawText(text, (int)offsetPoint[0], (int)offsetPoint[1]);
-    fillTextureData();
-}
-
-void CanvasRenderingContext2DDelegate::strokeText(const ccstd::string &text, float /*x*/, float /*y*/, float /*maxWidth*/) const {
-    if (text.empty() || _bufferWidth < 1.0F || _bufferHeight < 1.0F) {
-        return;
+    std::vector<uint8_t> coverageMask;
+    if (rasterizeText(text, offsetPoint[0], offsetPoint[1], &coverageMask)) {
+        compositeCoverage(coverageMask, _fillStyle);
+    } else {
+        drawText(text, static_cast<int>(std::round(offsetPoint[0])), static_cast<int>(std::round(offsetPoint[1])));
+        fillTextureData(_fillStyle);
     }
 }
 
@@ -174,10 +247,16 @@ CanvasRenderingContext2DDelegate::Size CanvasRenderingContext2DDelegate::measure
     if (text.empty())
         return ccstd::array<float, 2>{0.0f, 0.0f};
 
+    float width = 0.0F;
+    float height = 0.0F;
+    if (_useDirectWrite && _directWriteRasterizer->measureText(text.data(), text.size(), &width, &height)) {
+        return Size{width, height};
+    }
+
     int bufferLen = 0;
     wchar_t *pwszBuffer = CanvasRenderingContext2DDelegate::utf8ToUtf16(text, &bufferLen);
     Size size = sizeWithText(pwszBuffer, bufferLen);
-    //SE_LOGD("CanvasRenderingContext2DImpl::measureText: %s, %d, %d\n", text.c_str(), size.cx, size.cy);
+    // SE_LOGD("CanvasRenderingContext2DImpl::measureText: %s, %d, %d\n", text.c_str(), size.cx, size.cy);
     CC_SAFE_DELETE_ARRAY(pwszBuffer);
     return size;
 }
@@ -232,7 +311,8 @@ void CanvasRenderingContext2DDelegate::updateFont(const ccstd::string &fontName,
 
         tFont.lfItalic = italic;
 
-        // disable Cleartype
+        // DirectWrite is used for installed system fonts. Keep grayscale GDI as
+        // a fallback for project fonts registered through AddFontResource.
         tFont.lfQuality = ANTIALIASED_QUALITY;
 
         // delete old font
@@ -260,6 +340,13 @@ void CanvasRenderingContext2DDelegate::updateFont(const ccstd::string &fontName,
             SelectObject(_DC, _font);
             SendMessage(_wnd, WM_FONTCHANGE, 0, 0);
         }
+
+        const ccstd::string directWriteFontFamily = _fontName.empty() ? ccstd::string("Arial") : _fontName;
+        _useDirectWrite = fontPath.empty() && _directWriteRasterizer->updateFont(directWriteFontFamily.data(),
+                                                                                 directWriteFontFamily.size(),
+                                                                                 fontSize,
+                                                                                 bold,
+                                                                                 italic);
     } while (false);
 }
 
@@ -391,66 +478,118 @@ void CanvasRenderingContext2DDelegate::prepareBitmap(int nWidth, int nHeight) {
 
     if (nWidth > 0 && nHeight > 0) {
         _bmp = CreateBitmap(nWidth, nHeight, 1, 32, nullptr);
-        SelectObject(_DC, _bmp);
+        if (!_bmp) {
+            return;
+        }
+        HGDIOBJ previousBitmap = SelectObject(_DC, _bmp);
+        if (!previousBitmap || previousBitmap == HGDI_ERROR) {
+            DeleteObject(_bmp);
+            _bmp = nullptr;
+            return;
+        }
+        if (!_defaultBitmap) {
+            _defaultBitmap = static_cast<HBITMAP>(previousBitmap);
+        }
+        clearBitmapMask();
     }
 }
 
 void CanvasRenderingContext2DDelegate::deleteBitmap() {
     if (_bmp) {
+        if (_DC && _defaultBitmap && GetCurrentObject(_DC, OBJ_BITMAP) == _bmp) {
+            SelectObject(_DC, _defaultBitmap);
+        }
         DeleteObject(_bmp);
         _bmp = nullptr;
     }
 }
 
-void CanvasRenderingContext2DDelegate::fillTextureData() {
-    do {
-        auto dataLen = static_cast<int>(_bufferWidth * _bufferHeight * 4);
-        auto *dataBuf = static_cast<unsigned char *>(malloc(sizeof(unsigned char) * dataLen));
-        CC_BREAK_IF(!dataBuf);
-        unsigned char *imageBuf = _imageData.getBytes();
-        CC_BREAK_IF(!imageBuf);
+void CanvasRenderingContext2DDelegate::clearBitmapMask() {
+    if (_DC && _bmp && _bufferWidth > 0.0F && _bufferHeight > 0.0F) {
+        PatBlt(_DC, 0, 0, static_cast<int>(_bufferWidth), static_cast<int>(_bufferHeight), BLACKNESS);
+    }
+}
 
-        struct
-        {
-            BITMAPINFOHEADER bmiHeader;
-            int mask[4];
-        } bi = {0};
-        bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
-        CC_BREAK_IF(!GetDIBits(_DC, _bmp, 0, 0,
-                               nullptr, (LPBITMAPINFO)&bi, DIB_RGB_COLORS));
+bool CanvasRenderingContext2DDelegate::readBitmapCoverage(std::vector<uint8_t> *coverageMask) {
+    if (!coverageMask || !_DC || !_bmp || _bufferWidth < 1.0F || _bufferHeight < 1.0F) {
+        return false;
+    }
 
-        // copy pixel data
-        bi.bmiHeader.biHeight = (bi.bmiHeader.biHeight > 0) ? -bi.bmiHeader.biHeight : bi.bmiHeader.biHeight;
-        GetDIBits(_DC, _bmp, 0, static_cast<UINT>(_bufferHeight), dataBuf,
-                  (LPBITMAPINFO)&bi, DIB_RGB_COLORS);
+    const int width = static_cast<int>(_bufferWidth);
+    const int height = static_cast<int>(_bufferHeight);
+    std::vector<uint8_t> bitmapData(static_cast<size_t>(width) * static_cast<size_t>(height) * 4U);
+    BITMAPINFO bitmapInfo{};
+    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmapInfo.bmiHeader.biWidth = width;
+    bitmapInfo.bmiHeader.biHeight = -height;
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+    if (!_defaultBitmap) {
+        return false;
+    }
+    SelectObject(_DC, _defaultBitmap);
+    const int scanLines = GetDIBits(_DC,
+                                    _bmp,
+                                    0,
+                                    static_cast<UINT>(height),
+                                    bitmapData.data(),
+                                    &bitmapInfo,
+                                    DIB_RGB_COLORS);
+    SelectObject(_DC, _bmp);
+    if (scanLines == 0) {
+        return false;
+    }
 
-        uint8_t r = static_cast<uint8_t>(round(_fillStyle[0] * 255));
-        uint8_t g = static_cast<uint8_t>(round(_fillStyle[1] * 255));
-        uint8_t b = static_cast<uint8_t>(round(_fillStyle[2] * 255));
-        COLORREF textColor = (b << 16 | g << 8 | r) & 0x00ffffff;
-        COLORREF *pPixel = nullptr;
-        COLORREF *pImage = nullptr;
-        int bufferHeight = static_cast<int>(_bufferHeight);
-        int bufferWidth = static_cast<int>(_bufferWidth);
-        for (int y = 0; y < bufferHeight; ++y) {
-            pPixel = (COLORREF *)dataBuf + y * bufferWidth;
-            pImage = (COLORREF *)imageBuf + y * bufferWidth;
-            for (int x = 0; x < bufferWidth; ++x) {
-                COLORREF &clr = *pPixel;
-                COLORREF &val = *pImage;
-                // Because text is drawn in white color, and background color is black,
-                // so the red value is equal to alpha value. And we should keep this value
-                // as it includes anti-atlas information.
-                uint8_t alpha = GetRValue(clr);
-                if (alpha > 0) {
-                    val = (alpha << 24) | textColor;
-                }
-                ++pPixel;
-                ++pImage;
-            }
-        }
-        free(dataBuf);
-    } while (false);
+    coverageMask->resize(static_cast<size_t>(width) * static_cast<size_t>(height));
+    for (size_t pixelIndex = 0; pixelIndex < coverageMask->size(); ++pixelIndex) {
+        // GDI renders white text on a black bitmap, so every color channel is
+        // the grayscale coverage value.
+        (*coverageMask)[pixelIndex] = bitmapData[pixelIndex * 4U + 2U];
+    }
+    return true;
+}
+
+bool CanvasRenderingContext2DDelegate::rasterizeText(const ccstd::string &text,
+                                                     float x,
+                                                     float y,
+                                                     std::vector<uint8_t> *coverageMask) const {
+    return _useDirectWrite && _directWriteRasterizer->rasterize(text.data(),
+                                                                text.size(),
+                                                                x,
+                                                                y,
+                                                                static_cast<int>(_bufferWidth),
+                                                                static_cast<int>(_bufferHeight),
+                                                                coverageMask);
+}
+
+void CanvasRenderingContext2DDelegate::compositeCoverage(const std::vector<uint8_t> &coverageMask,
+                                                         const Color4F &color,
+                                                         uint32_t dilationRadius) {
+    uint8_t *imageBuffer = _imageData.getBytes();
+    const int width = static_cast<int>(_bufferWidth);
+    const int height = static_cast<int>(_bufferHeight);
+    if (!imageBuffer || width <= 0 || height <= 0 || coverageMask.size() != static_cast<size_t>(width) * static_cast<size_t>(height)) {
+        return;
+    }
+
+    const std::vector<uint8_t> expandedCoverage = dilateCoverage(coverageMask, width, height, dilationRadius);
+    const uint8_t red = static_cast<uint8_t>(std::round(color[0] * 255.0F));
+    const uint8_t green = static_cast<uint8_t>(std::round(color[1] * 255.0F));
+    const uint8_t blue = static_cast<uint8_t>(std::round(color[2] * 255.0F));
+    const float colorAlpha = color[3];
+    for (size_t pixelIndex = 0; pixelIndex < expandedCoverage.size(); ++pixelIndex) {
+        const uint8_t alpha = static_cast<uint8_t>(std::round(static_cast<float>(expandedCoverage[pixelIndex]) * colorAlpha));
+        blendStraightAlpha(imageBuffer + pixelIndex * 4U, red, green, blue, alpha);
+    }
+}
+
+void CanvasRenderingContext2DDelegate::fillTextureData(const Color4F &color, uint32_t dilationRadius) {
+    std::vector<uint8_t> coverageMask;
+    if (readBitmapCoverage(&coverageMask)) {
+        compositeCoverage(coverageMask, color, dilationRadius);
+    }
+    clearBitmapMask();
 }
 
 ccstd::array<float, 2> CanvasRenderingContext2DDelegate::convertDrawPoint(Point point, const ccstd::string &text) {
@@ -461,17 +600,26 @@ ccstd::array<float, 2> CanvasRenderingContext2DDelegate::convertDrawPoint(Point 
         point[0] -= textSize[0];
     }
 
+    float directWriteLineHeight = 0.0F;
+    float directWriteBaseline = 0.0F;
+    const bool hasDirectWriteMetrics = _useDirectWrite && _directWriteRasterizer->getLineMetrics(&directWriteLineHeight, &directWriteBaseline);
     if (_textBaseLine == TextBaseline::TOP) {
         // DrawText default
-        GetTextMetrics(_DC, &_tm);
-        point[1] += -_tm.tmInternalLeading;
+        if (!hasDirectWriteMetrics) {
+            GetTextMetrics(_DC, &_tm);
+            point[1] += -_tm.tmInternalLeading;
+        }
     } else if (_textBaseLine == TextBaseline::MIDDLE) {
-        point[1] += -textSize[1] / 2.0f;
+        point[1] += -(hasDirectWriteMetrics ? directWriteLineHeight : textSize[1]) / 2.0F;
     } else if (_textBaseLine == TextBaseline::BOTTOM) {
-        point[1] += -textSize[1];
+        point[1] += -(hasDirectWriteMetrics ? directWriteLineHeight : textSize[1]);
     } else if (_textBaseLine == TextBaseline::ALPHABETIC) {
-        GetTextMetrics(_DC, &_tm);
-        point[1] -= _tm.tmAscent;
+        if (hasDirectWriteMetrics) {
+            point[1] -= directWriteBaseline;
+        } else {
+            GetTextMetrics(_DC, &_tm);
+            point[1] -= _tm.tmAscent;
+        }
     }
 
     return point;
@@ -493,10 +641,23 @@ void CanvasRenderingContext2DDelegate::fillImageData(const Data & /* imageData *
                                                      float /* offsetY */) {
 }
 
-void CanvasRenderingContext2DDelegate::strokeText(const ccstd::string & /* text */,
-                                                  float /* x */,
-                                                  float /* y */,
+void CanvasRenderingContext2DDelegate::strokeText(const ccstd::string &text,
+                                                  float x,
+                                                  float y,
                                                   float /* maxWidth */) {
+    if (text.empty() || _bufferWidth < 1.0F || _bufferHeight < 1.0F || _lineWidth <= 0.0F) {
+        return;
+    }
+
+    Point offsetPoint = convertDrawPoint(Point{x, y}, text);
+    const uint32_t outlineRadius = static_cast<uint32_t>(std::max(1.0F, std::ceil(_lineWidth * 0.5F)));
+    std::vector<uint8_t> coverageMask;
+    if (rasterizeText(text, offsetPoint[0], offsetPoint[1], &coverageMask)) {
+        compositeCoverage(coverageMask, _strokeStyle, outlineRadius);
+    } else {
+        drawText(text, static_cast<int>(std::round(offsetPoint[0])), static_cast<int>(std::round(offsetPoint[1])));
+        fillTextureData(_strokeStyle, outlineRadius);
+    }
 }
 
 void CanvasRenderingContext2DDelegate::rect(float /* x */,

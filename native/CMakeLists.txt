@@ -634,6 +634,8 @@ elseif(WINDOWS)
     cocos_source_files(
         cocos/platform/win32/modules/CanvasRenderingContext2DDelegate.cpp
         cocos/platform/win32/modules/CanvasRenderingContext2DDelegate.h
+        cocos/platform/win32/modules/DirectWriteTextRasterizer.cpp
+        cocos/platform/win32/modules/DirectWriteTextRasterizer.h
     )
 elseif(OPENHARMONY)
     cocos_source_files(
@@ -3184,7 +3186,7 @@ if(NX)
     include(${CMAKE_CURRENT_LIST_DIR}/platform-nx/setup.cmake)
 elseif(WINDOWS)
     target_link_libraries(${ENGINE_NAME} PUBLIC
-        ws2_32 userenv psapi winmm Iphlpapi
+        ws2_32 userenv psapi winmm Iphlpapi dwrite
         ${CC_EXTERNAL_LIBS}
     )
     cc_win32_definations(${ENGINE_NAME})

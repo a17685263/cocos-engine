@@ -24,11 +24,17 @@
 
 #pragma once
 
+#ifndef NOMINMAX
+    #define NOMINMAX
+#endif
+
 #include "platform/interfaces/modules/canvas/ICanvasRenderingContext2D.h"
 
 #include <Windows.h>
 #include <cstdint>
+#include <memory>
 #include <regex>
+#include <vector>
 #include "base/csscolorparser.h"
 #include "base/std/container/array.h"
 #include "cocos/bindings/jswrapper/SeApi.h"
@@ -37,6 +43,8 @@
 #include "platform/FileUtils.h"
 
 namespace cc {
+
+class DirectWriteTextRasterizer;
 
 class CC_DLL CanvasRenderingContext2DDelegate : public ICanvasRenderingContext2D::Delegate {
 public:
@@ -60,7 +68,6 @@ public:
     void clearRect(float /*x*/, float /*y*/, float w, float h) override;
     void fillRect(float x, float y, float w, float h) override;
     void fillText(const ccstd::string &text, float x, float y, float /*maxWidth*/) override;
-    void strokeText(const ccstd::string &text, float /*x*/, float /*y*/, float /*maxWidth*/) const;
     Size measureText(const ccstd::string &text) override;
     void updateFont(const ccstd::string &fontName, float fontSize, bool bold, bool italic, bool oblique, bool smallCaps) override;
     void setTextAlign(TextAlign align) override;
@@ -88,7 +95,11 @@ private:
     Size sizeWithText(const wchar_t *pszText, int nLen);
     void prepareBitmap(int nWidth, int nHeight);
     void deleteBitmap();
-    void fillTextureData();
+    void clearBitmapMask();
+    bool readBitmapCoverage(std::vector<uint8_t> *coverageMask);
+    bool rasterizeText(const ccstd::string &text, float x, float y, std::vector<uint8_t> *coverageMask) const;
+    void compositeCoverage(const std::vector<uint8_t> &coverageMask, const Color4F &color, uint32_t dilationRadius = 0U);
+    void fillTextureData(const Color4F &color, uint32_t dilationRadius = 0U);
     ccstd::array<float, 2> convertDrawPoint(Point point, const ccstd::string &text);
 
 public:
@@ -97,9 +108,11 @@ public:
 
 private:
     cc::Data _imageData;
+    HBITMAP _defaultBitmap{nullptr};
     HFONT _font{static_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT))};
     HWND _wnd{nullptr};
-    HPEN _hpen;
+    HPEN _hpen{nullptr};
+    HGDIOBJ _previousPen{nullptr};
     PAINTSTRUCT _paintStruct;
     ccstd::string _curFontPath;
     int _savedDC{0};
@@ -114,6 +127,8 @@ private:
     TextBaseline _textBaseLine{TextBaseline::TOP};
     Color4F _fillStyle;
     Color4F _strokeStyle;
+    std::unique_ptr<DirectWriteTextRasterizer> _directWriteRasterizer;
+    bool _useDirectWrite{false};
 
     TEXTMETRIC _tm;
 };
