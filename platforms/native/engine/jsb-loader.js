@@ -198,7 +198,7 @@ function downloadBundle (nameOrUrl, options, onComplete) {
         }
     const config = `${url}/cc.config.${version ? `${version}.` : ''}json`;
     options.__cacheBundleRoot__ = bundleName;
-    downloadJson(config, options, (err, response) => {
+    const onConfigDownloaded = (err, response) => {
         if (err) {
             return onComplete(err, null);
         }
@@ -216,6 +216,21 @@ function downloadBundle (nameOrUrl, options, onComplete) {
         } else {
             onComplete(null, out);
         }
+    };
+    downloadJson(config, options, (err, response) => {
+        if (!err) {
+            return onConfigDownloaded(null, response);
+        }
+
+        // Web bundles use config.json while native bundles use cc.config.json.
+        // Allow the Windows simulator/native runtime to consume an existing
+        // remote Web bundle server without requiring duplicate config files.
+        if (REGEX.test(nameOrUrl)) {
+            const webConfig = `${url}/config.${version ? `${version}.` : ''}json`;
+            return downloadJson(webConfig, options, onConfigDownloaded);
+        }
+
+        onConfigDownloaded(err, null);
     });
 }
 
@@ -409,3 +424,4 @@ cc.assetManager.init = function (options) {
     initJsbDownloader(jsbDownloaderMaxTasks, jsbDownloaderTimeout);
     cacheManager.init();
 };
+
